@@ -25,8 +25,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from selenium.webdriver.chrome.service import Service as ChromeService
-import webdriver_manager.chrome as ChromeDriverManager
-ChromeDriverManager = ChromeDriverManager.ChromeDriverManager
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 log = logging.getLogger(__name__)
@@ -102,10 +101,12 @@ class EasyApplyBot:
         self.start_linkedin(username, password)
         self.phone_number = phone_number
         self.experience_level = experience_level
+        self.shadow_host_selector = None  # Will store the shadow host selector where modal is found
 
 
         self.locator = {
             "next": (By.CSS_SELECTOR, "button[aria-label='Continue to next step']"),
+            "next_generic": (By.XPATH, "//button[contains(text(), 'Next')]"),  # Generic Next button by text
             "review": (By.CSS_SELECTOR, "button[aria-label='Review your application']"),
             "submit": (By.CSS_SELECTOR, "button[aria-label='Submit application']"),
             "error": (By.CLASS_NAME, "artdeco-inline-feedback__message"),
@@ -120,7 +121,8 @@ class EasyApplyBot:
             "multi_select": (By.XPATH, "//*[contains(@id, 'text-entity-list-form-component')]"),
             "text_select": (By.CLASS_NAME, "artdeco-text-input--input"),
             "2fa_oneClick": (By.ID, 'reset-password-submit-button'),
-            "easy_apply_button": (By.XPATH, '//button[contains(@class, "jobs-apply-button")]')
+            "easy_apply_button": (By.XPATH, '//button[contains(@aria-label, "Easy Apply") and contains(@class, "jobs-apply-button")]'),
+            "easy_apply_button_a": (By.XPATH, '//a[contains(@data-view-name, "job-apply-button") and contains(.//span, "Easy Apply")]'),
 
         }
 
@@ -177,26 +179,46 @@ class EasyApplyBot:
         log.info("Logging in.....Please wait :)  ")
         self.browser.get("https://www.linkedin.com/login?trk=guest_homepage-basic_nav-header-signin")
         try:
-            user_field = self.browser.find_element("id","username")
-            pw_field = self.browser.find_element("id","password")
-            login_button = self.browser.find_element("xpath",
-                        '//*[@id="organic-div"]/form/div[3]/button')
+            # Wait for username and password fields
+            user_field = self.wait.until(EC.presence_of_element_located((By.ID, "username")))
+            pw_field = self.wait.until(EC.presence_of_element_located((By.ID, "password")))
+
+            # Older selectors retained for future reference:
+            # (By.XPATH, '//*[@id="organic-div"]/form/div[3]/button')
+            # (By.XPATH, '//button[@type="submit" and contains(@class, "btn-primary")]')
+            # (By.XPATH, '//button[contains(text(), "Sign in")]')
+            # (By.CSS_SELECTOR, 'button[type="submit"]')
+
+            # Best selectors for the current Sign in button
+            login_button = None
+            login_selectors = [
+                (By.CSS_SELECTOR, 'button[data-litms-control-urn="login-submit"]'),  # most robust
+                (By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]'),     # specific by type and class
+                (By.XPATH, '//button[contains(text(), "Sign in")]'),               # fallback: visible text
+                (By.CSS_SELECTOR, 'button[type="submit"]'),                        # generic fallback
+            ]
+            for selector in login_selectors:
+                try:
+                    login_button = self.wait.until(EC.element_to_be_clickable(selector))
+                    break
+                except TimeoutException:
+                    continue
+            if login_button is None:
+                raise TimeoutException("Login button not found with any selector!")
+
             user_field.send_keys(username)
             user_field.send_keys(Keys.TAB)
-            time.sleep(2)
+            time.sleep(1)
             pw_field.send_keys(password)
-            time.sleep(2)
+            time.sleep(1)
             login_button.click()
-            time.sleep(15)
-            # if self.is_present(self.locator["2fa_oneClick"]):
-            #     oneclick_auth = self.browser.find_element(by='id', value='reset-password-submit-button')
-            #     if oneclick_auth is not None:
-            #         log.info("additional authentication required, sleep for 15 seconds so you can do that")
-            #         time.sleep(15)
-            # else:
-            #     time.sleep()
-        except TimeoutException:
-            log.info("TimeoutException! Username/password field or login button not found")
+            time.sleep(5)  # enough time for redirect/2FA if needed
+        except TimeoutException as e:
+            log.error(f"TimeoutException! Username/password field or login button not found: {e}")
+            raise
+        except Exception as e:
+            log.error(f"Error during login: {e}")
+            raise
 
     def fill_data(self) -> None:
         self.browser.set_window_size(1, 1)
@@ -327,9 +349,383 @@ class EasyApplyBot:
             else:
                 string_easy = "* has Easy Apply Button"
                 log.info("Clicking the EASY apply button")
-                button.click()
+                
+                # Verify button state before clicking and capture screenshot
+                try:
+                    # Capture screenshot before clicking
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    screenshot_before = f"logs/screenshot_before_click_{timestamp}.png"
+                    self.browser.save_screenshot(screenshot_before)
+                    log.info(f"Screenshot captured before click: {screenshot_before}")
+                    
+                    log.debug(f"Button state: displayed={button.is_displayed()}, enabled={button.is_enabled()}")
+                    log.debug(f"Button location: {button.location}, size: {button.size}")
+                    log.debug(f"Button classes: {button.get_attribute('class')}")
+                    log.debug(f"Button aria-label: {button.get_attribute('aria-label')}")
+                    log.debug(f"Button text: {button.text}")
+                    
+                    if not button.is_displayed():
+                        log.warning("Button is not displayed, scrolling into view")
+                        self.browser.execute_script("arguments[0].scrollIntoView(true);", button)
+                        time.sleep(0.5)
+                except Exception as e:
+                    log.debug(f"Error checking button state: {e}")
+                
+                # Try multiple click methods
+                clicked = False
+                try:
+                    # Method 1: Native Selenium click
+                    button.click()
+                    clicked = True
+                    log.info("Used native Selenium click")
+                    
+                    # Capture screenshot after successful click
+                    screenshot_after = f"logs/screenshot_after_click_{timestamp}.png"
+                    self.browser.save_screenshot(screenshot_after)
+                    log.info(f"Screenshot captured after click: {screenshot_after}")
+                except Exception as click_error:
+                    log.debug(f"Native click failed: {click_error}")
+                    try:
+                        # Method 2: JavaScript click
+                        self.browser.execute_script('arguments[0].click()', button)
+                        clicked = True
+                        log.info("Used JavaScript click")
+                        
+                        # Capture screenshot after JavaScript click
+                        screenshot_after = f"logs/screenshot_after_click_{timestamp}.png"
+                        self.browser.save_screenshot(screenshot_after)
+                        log.info(f"Screenshot captured after click: {screenshot_after}")
+                    except Exception as js_error:
+                        log.debug(f"JavaScript click failed: {js_error}")
+                        try:
+                            # Method 3: ActionChains click
+                            from selenium.webdriver.common.action_chains import ActionChains
+                            ActionChains(self.browser).move_to_element(button).click().perform()
+                            clicked = True
+                            log.info("Used ActionChains click")
+                            
+                            # Capture screenshot after ActionChains click
+                            screenshot_after = f"logs/screenshot_after_click_{timestamp}.png"
+                            self.browser.save_screenshot(screenshot_after)
+                            log.info(f"Screenshot captured after click: {screenshot_after}")
+                        except Exception as action_error:
+                            log.error(f"All click methods failed: {action_error}")
+                
+                # Capture screenshot after any click attempt or if all methods failed
+                try:
+                    screenshot_final = f"logs/screenshot_final_state_{timestamp}.png"
+                    self.browser.save_screenshot(screenshot_final)
+                    if clicked:
+                        log.info(f"Final screenshot captured: {screenshot_final}")
+                    else:
+                        log.warning(f"Final screenshot after failed click attempts: {screenshot_final}")
+                except Exception as screenshot_error:
+                    log.debug(f"Failed to capture final screenshot: {screenshot_error}")
+                
+                if clicked:
+                    log.info("Successfully clicked Easy Apply button")
+                else:
+                    log.error("Failed to click Easy Apply button")
                 clicked = True
+                
+                # CRITICAL: Wait for the modal to actually appear using WebDriverWait
+                log.info("Waiting for modal to appear...")
+                
+                # Check for and dismiss blocking overlays/popups that prevent modal from opening
+                try:
+                    log.info("Checking for blocking overlays/popups...")
+                    
+                    # Common overlay selectors on LinkedIn
+                    overlay_selectors = [
+                        "button[aria-label='Dismiss']",
+                        "button.artdeco-modal__dismiss",
+                        ".artdeco-toast",
+                        "button[data-tracking-control-name='dismiss']",
+                        ".msg-overlay-bubble-header__controls button",
+                        # Check for any modal or overlay that might be blocking
+                        "div[role='alert']",
+                        "div.artdeco-overlay",
+                    ]
+                    
+                    for overlay_selector in overlay_selectors:
+                        try:
+                            overlays = self.browser.find_elements(By.CSS_SELECTOR, overlay_selector)
+                            if overlays:
+                                log.info(f"Found {len(overlays)} overlay element(s) with selector: {overlay_selector}")
+                                for overlay in overlays:
+                                    if overlay.is_displayed():
+                                        try:
+                                            overlay.click()
+                                            log.info("Dismissed blocking overlay")
+                                            time.sleep(0.5)
+                                        except:
+                                            log.debug("Could not click overlay, trying JavaScript click")
+                                            try:
+                                                self.browser.execute_script('arguments[0].click()', overlay)
+                                                log.info("Dismissed blocking overlay via JavaScript")
+                                                time.sleep(0.5)
+                                            except:
+                                                log.debug("Failed to dismiss overlay")
+                        except Exception as overlay_error:
+                            log.debug(f"Error checking overlay selector {overlay_selector}: {overlay_error}")
+                    
+                    # Check for ESC key-needed popups or notifications
+                    try:
+                        # Press ESC to dismiss any keyboard-trapped overlays
+                        from selenium.webdriver.common.keys import Keys
+                        self.browser.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+                        log.debug("Pressed ESC to dismiss any overlays")
+                        time.sleep(0.5)
+                    except:
+                        pass
+                        
+                except Exception as e:
+                    log.debug(f"Error during overlay check: {e}")
+                
+                # Try to wait for modal appearance using WebDriverWait
+                modal_wait = WebDriverWait(self.browser, 10)
+                modal_detected_via_wait = False
+                modal_selectors = [
+                    (By.CSS_SELECTOR, "div[role='dialog']"),
+                    (By.CSS_SELECTOR, ".jobs-easy-apply-modal"),
+                    (By.CSS_SELECTOR, "div[data-test-modal]")
+                ]
+                
+                for selector in modal_selectors:
+                    try:
+                        element = modal_wait.until(EC.presence_of_element_located(selector))
+                        if element:
+                            log.info(f"Modal detected via WebDriverWait with selector: {selector[1]}")
+                            modal_detected_via_wait = True
+                            break
+                    except TimeoutException:
+                        log.debug(f"Timeout waiting for modal with selector: {selector[1]}")
+                        continue
+                
+                if not modal_detected_via_wait:
+                    log.warning("Modal not detected via WebDriverWait, checking manually...")
+                    time.sleep(2)  # Fallback sleep
+                
+                # Check for shadow DOM - this is where LinkedIn renders the modal
+                log.info("Checking for Shadow DOM...")
+                shadow_hosts = self.find_all_shadow_hosts()
+                
+                # Try common shadow host locations
+                common_shadow_selectors = [
+                    "div[id='interop-outlet']",
+                    "div[data-testid='interop-outlet']",
+                    "#interop-outlet"
+                ]
+                
+                modal_in_shadow_dom = False
+                for selector in common_shadow_selectors:
+                    try:
+                        log.info(f"Checking shadow host: {selector}")
+                        dialogs_in_shadow = self.find_in_shadow_dom(selector, "div[role='dialog']")
+                        modals_in_shadow = self.find_in_shadow_dom(selector, ".jobs-easy-apply-modal")
+                        modal_data_in_shadow = self.find_in_shadow_dom(selector, "div[data-test-modal]")
+                        
+                        if dialogs_in_shadow or modals_in_shadow or modal_data_in_shadow:
+                            log.info(f"*** MODAL FOUND IN SHADOW DOM at {selector}! ***")
+                            modal_in_shadow_dom = True
+                            self.shadow_host_selector = selector  # Store for later use
+                            break
+                        
+                        # Additional check: Look for buttons in shadow DOM
+                        buttons_in_shadow = self.find_in_shadow_dom(selector, "button")
+                        if buttons_in_shadow:
+                            log.info(f"Found {len(buttons_in_shadow)} buttons in shadow DOM at {selector}")
+                            for btn in buttons_in_shadow[:5]:  # Check first 5 buttons
+                                try:
+                                    btn_text = self.browser.execute_script('return arguments[0].textContent', btn)
+                                    btn_aria = self.browser.execute_script('return arguments[0].getAttribute("aria-label")', btn)
+                                    log.info(f"  Shadow button: text='{btn_text.strip()[:50]}', aria-label='{btn_aria}'")
+                                except:
+                                    pass
+                            # If we found buttons but not a modal, maybe the modal is inside a nested structure
+                            # Try looking for any div that might be a modal container
+                            all_divs = self.browser.execute_script("""
+                                var shadowHost = arguments[0];
+                                var shadowRoot = shadowHost.shadowRoot;
+                                if (shadowRoot) {
+                                    return Array.from(shadowRoot.querySelectorAll('div'));
+                                }
+                                return [];
+                            """, self.browser.find_element(By.CSS_SELECTOR, selector))
+                            log.info(f"Found {len(all_divs)} divs in shadow DOM")
+                            
+                    except Exception as e:
+                        log.debug(f"Error checking {selector}: {e}")
+                
+                # Additional wait for page to fully load (reduced from 5 to 1 second since we already used WebDriverWait)
                 time.sleep(1)
+                
+                # Check for modal presence with better detection
+                modal_detected = False
+                dialogs = self.browser.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
+                log.info(f"Found {len(dialogs)} dialog elements")
+                
+                # Also check for the specific modal classes
+                try:
+                    modal_by_class = self.browser.find_elements(By.CSS_SELECTOR, ".jobs-easy-apply-modal")
+                    log.info(f"Found {len(modal_by_class)} elements with .jobs-easy-apply-modal class")
+                    if modal_by_class:
+                        for modal in modal_by_class:
+                            is_displayed = modal.is_displayed()
+                            log.info(f"Modal: displayed={is_displayed}, visible={modal.get_attribute('style')}")
+                            if is_displayed:
+                                modal_detected = True
+                except Exception as e:
+                    log.debug(f"Error checking modal by class: {e}")
+                
+                # Check for the specific data attribute
+                try:
+                    modal_by_data = self.browser.find_elements(By.CSS_SELECTOR, "div[data-test-modal]")
+                    log.info(f"Found {len(modal_by_data)} elements with data-test-modal")
+                    if modal_by_data:
+                        for modal in modal_by_data:
+                            if modal.is_displayed():
+                                modal_detected = True
+                except Exception as e:
+                    log.debug(f"Error checking modal by data: {e}")
+                
+                if len(dialogs) > 0 or modal_detected:
+                    log.info(f"Modal detected! Found {len(dialogs)} dialog(s)")
+                    modal_detected = True
+                
+                # Additional detailed check for debugging
+                try:
+                    dialogs = self.browser.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
+                    log.info(f"Immediate check: Found {len(dialogs)} dialog elements")
+                    if dialogs:
+                        for i, dialog in enumerate(dialogs):
+                            log.info(f"Dialog {i}: displayed={dialog.is_displayed()}, text={dialog.text[:100]}")
+                    
+                    # Check iframes - the modal might be inside one
+                    iframes = self.browser.find_elements(By.TAG_NAME, "iframe")
+                    log.info(f"Found {len(iframes)} iframes")
+                    
+                    # Look for the specific interop iframe
+                    interop_iframe = None
+                    try:
+                        interop_iframe = self.browser.find_element(By.CSS_SELECTOR, "iframe[data-testid='interop-iframe']")
+                        log.info("Found interop-iframe")
+                    except:
+                        log.info("No interop-iframe found")
+                    
+                    # Store info about which iframe might contain the modal
+                    modal_iframe_index = None
+                    
+                    for i, iframe in enumerate(iframes):
+                        try:
+                            # Try to get the iframe src to see what it contains
+                            src = iframe.get_attribute("src")
+                            data_testid = iframe.get_attribute("data-testid")
+                            log.info(f"Iframe {i}: src={src}, data-testid={data_testid}, visible={iframe.is_displayed()}")
+                            
+                            # Try switching to the iframe
+                            self.browser.switch_to.frame(iframe)
+                            
+                            # Check for dialog in iframe first (this is the key)
+                            dialogs_in_iframe = self.browser.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
+                            if dialogs_in_iframe:
+                                log.info(f"  *** Found {len(dialogs_in_iframe)} dialog(s) in iframe {i}! ***")
+                                modal_iframe_index = i
+                                for j, dialog in enumerate(dialogs_in_iframe):
+                                    log.info(f"    Dialog {j}: text={dialog.text[:100] if dialog.text else 'empty'}")
+                            
+                            buttons_in_iframe = self.browser.find_elements(By.TAG_NAME, "button")
+                            log.info(f"  Buttons in iframe {i}: {len(buttons_in_iframe)}")
+                            
+                            # Look specifically for "Next" button
+                            next_found = False
+                            for btn in buttons_in_iframe[:15]:
+                                aria_label = btn.get_attribute("aria-label")
+                                if aria_label and "next" in aria_label.lower():
+                                    log.info(f"    *** Found Next button! ***")
+                                    log.info(f"    Button: text='{btn.text}', aria-label='{aria_label}'")
+                                    next_found = True
+                            
+                            if not next_found and buttons_in_iframe:
+                                # Log first few buttons anyway
+                                for btn in buttons_in_iframe[:5]:
+                                    log.info(f"    Button: text='{btn.text}', aria-label='{btn.get_attribute('aria-label')}'")
+                            
+                            self.browser.switch_to.default_content()
+                        except Exception as iframe_e:
+                            log.info(f"  Could not access iframe {i}: {iframe_e}")
+                            try:
+                                self.browser.switch_to.default_content()
+                            except:
+                                pass
+                    
+                    if modal_iframe_index is not None:
+                        log.info(f"Modal is likely in iframe {modal_iframe_index}")
+                except Exception as e:
+                    log.debug(f"Error in immediate check: {e}")
+                
+                # Wait for modal to appear with multiple attempts
+                modal_present = False
+                for attempt in range(3):
+                    try:
+                        # Try multiple modal selectors
+                        modal_selectors = [
+                            "div[data-test-modal]",
+                            ".jobs-easy-apply-modal",
+                            ".artdeco-modal",
+                            "div[role='dialog']",
+                            ".jobs-easy-apply-modal__content"
+                        ]
+                        
+                        for selector in modal_selectors:
+                            try:
+                                element = self.browser.find_element(By.CSS_SELECTOR, selector)
+                                if element.is_displayed():
+                                    modal_present = True
+                                    log.info(f"Modal detected successfully with selector: {selector}")
+                                    break
+                            except:
+                                pass
+                        
+                        if modal_present:
+                            break
+                        
+                        # Debug: Check what's in the page source
+                        if attempt == 0:
+                            log.debug(f"Page title: {self.browser.title}")
+                            log.debug(f"Current URL: {self.browser.current_url}")
+                            # Check for common elements
+                            try:
+                                dialogs = self.browser.find_elements(By.CSS_SELECTOR, "div[role='dialog']")
+                                log.debug(f"Found {len(dialogs)} dialog elements")
+                                buttons = self.browser.find_elements(By.TAG_NAME, "button")
+                                log.debug(f"Total buttons on page: {len(buttons)}")
+                                
+                                # Check if any buttons have "Next" text
+                                for btn in buttons[:10]:  # Check first 10 buttons
+                                    btn_text = btn.text
+                                    aria_label = btn.get_attribute("aria-label")
+                                    if btn_text and "Next" in btn_text:
+                                        log.debug(f"Found button with 'Next' text: '{btn_text}' with aria-label: '{aria_label}'")
+                                    
+                                # Check for iframes
+                                iframes = self.browser.find_elements(By.TAG_NAME, "iframe")
+                                log.debug(f"Found {len(iframes)} iframes on the page")
+                                
+                            except Exception as e:
+                                log.debug(f"Error checking page: {e}")
+                        
+                        time.sleep(2)
+                        log.debug(f"Waiting for modal... attempt {attempt + 1}/5")
+                    except Exception as e:
+                        log.debug(f"Error during modal detection: {e}")
+                        time.sleep(2)
+                
+                if not modal_present:
+                    log.warning("Modal not detected after waiting, proceeding anyway")
+                    log.info("Proceeding to fill out fields...")
+                
+                time.sleep(2)  # Additional wait for form to fully render
                 self.fill_out_fields()
                 result: bool = self.send_resume()
                 if result:
@@ -380,32 +776,42 @@ class EasyApplyBot:
         EasyApplyButton = False
         try:
             buttons = self.get_elements("easy_apply_button")
-            # buttons = self.browser.find_elements("xpath",
-            #     '//button[contains(@class, "jobs-apply-button")]'
-            # )
-            for button in buttons:
+            buttons_a = self.get_elements("easy_apply_button_a")
+            all_buttons = buttons + buttons_a
+            for button in all_buttons:
                 if "Easy Apply" in button.text:
                     EasyApplyButton = button
                     self.wait.until(EC.element_to_be_clickable(EasyApplyButton))
+                    break
                 else:
                     log.debug("Easy Apply button not found")
-            
         except Exception as e: 
             print("Exception:",e)
             log.debug("Easy Apply button not found")
 
-
         return EasyApplyButton
 
     def fill_out_fields(self):
-        fields = self.browser.find_elements(By.CLASS_NAME, "jobs-easy-apply-form-section__grouping")
-        for field in fields:
-
-            if "Mobile phone number" in field.text:
-                field_input = field.find_element(By.TAG_NAME, "input")
-                field_input.clear()
-                field_input.send_keys(self.phone_number)
-
+        log.info("Filling out contact info fields")
+        
+        # Wait for the form to be fully loaded
+        time.sleep(1)
+        
+        # Handle mobile phone number input (email and country code are auto-filled by LinkedIn)
+        try:
+            inputs = self.browser.find_elements(By.TAG_NAME, "input")
+            for input_elem in inputs:
+                input_id = input_elem.get_attribute("id") or ""
+                # Check if this is the phone number input
+                if "phoneNumber-nationalNumber" in input_id:
+                    input_elem.clear()
+                    # Remove +92 prefix if present since country code is selected separately
+                    phone_number = self.phone_number.replace("+92", "").strip()
+                    input_elem.send_keys(phone_number)
+                    log.info(f"Entered phone number: {phone_number}")
+                    break
+        except Exception as e:
+            log.debug(f"Could not enter phone number: {e}")
 
         return
 
@@ -415,11 +821,72 @@ class EasyApplyBot:
         element = self.locator[type]
         if self.is_present(element):
             elements = self.browser.find_elements(element[0], element[1])
+        
+        # If no elements found in main document and we have a shadow host, search shadow DOM
+        if len(elements) == 0 and self.shadow_host_selector:
+            try:
+                elements = self.find_in_shadow_dom(self.shadow_host_selector, element[1])
+                if elements:
+                    log.info(f"Found {len(elements)} {type} element(s) in shadow DOM")
+            except Exception as e:
+                log.debug(f"Error searching for {type} in shadow DOM: {e}")
+        
         return elements
 
     def is_present(self, locator):
         return len(self.browser.find_elements(locator[0],
                                               locator[1])) > 0
+
+    def find_in_shadow_dom(self, shadow_host_selector, target_selector):
+        """Find elements inside shadow DOM"""
+        try:
+            shadow_host = self.browser.find_element(By.CSS_SELECTOR, shadow_host_selector)
+            shadow_root = self.browser.execute_script('return arguments[0].shadowRoot', shadow_host)
+            if shadow_root:
+                elements = self.browser.execute_script(
+                    'return arguments[0].querySelectorAll(arguments[1])', 
+                    shadow_root, target_selector
+                )
+                log.debug(f"Found {len(elements)} elements in shadow DOM with selector '{target_selector}'")
+                
+                # Debug: Log what's actually inside the shadow root
+                if len(elements) == 0 and target_selector == "div[role='dialog']":
+                    all_elements = self.browser.execute_script('return arguments[0].querySelectorAll("*")', shadow_root)
+                    log.debug(f"Shadow DOM contains {len(all_elements)} total elements")
+                    if len(all_elements) > 0:
+                        first_20 = all_elements[:20]
+                        for elem in first_20:
+                            tag = self.browser.execute_script('return arguments[0].tagName', elem)
+                            log.debug(f"  Element in shadow: {tag}")
+                
+                return elements
+        except Exception as e:
+            log.debug(f"Error accessing shadow DOM with '{shadow_host_selector}': {e}")
+        return []
+
+    def find_all_shadow_hosts(self):
+        """Find all elements on page that have a shadow root"""
+        try:
+            shadow_hosts_info = self.browser.execute_script("""
+                return Array.from(document.querySelectorAll('*'))
+                    .filter(el => el.shadowRoot)
+                    .map(el => {
+                        return {
+                            tagName: el.tagName,
+                            id: el.id,
+                            className: el.className,
+                            dataTestId: el.getAttribute('data-testid'),
+                            outerHTML: el.outerHTML.substring(0, 200)
+                        };
+                    });
+            """)
+            log.info(f"Found {len(shadow_hosts_info)} shadow hosts on page")
+            for i, host_info in enumerate(shadow_hosts_info):
+                log.info(f"Shadow host {i}: tag={host_info.get('tagName')}, id={host_info.get('id')}, data-testid={host_info.get('dataTestId')}")
+            return shadow_hosts_info
+        except Exception as e:
+            log.debug(f"Error finding shadow hosts: {e}")
+        return []
 
     def send_resume(self) -> bool:
         def is_present(button_locator) -> bool:
@@ -442,8 +909,35 @@ class EasyApplyBot:
 
             submitted = False
             loop = 0
-            while loop < 2:
+            while loop < 10:
+                log.debug(f"Loop iteration: {loop}")
+                loop += 1
                 time.sleep(1)
+                
+                # Debug: Check what elements are present
+                log.debug(f"Checking elements - upload_resume: {is_present(upload_resume_locator)}, "
+                         f"upload_cv: {is_present(upload_cv_locator)}, "
+                         f"submit: {len(self.get_elements('submit'))}, "
+                         f"error: {len(self.get_elements('error'))}, "
+                         f"next: {len(self.get_elements('next'))}, "
+                         f"review: {len(self.get_elements('review'))}, "
+                         f"follow: {len(self.get_elements('follow'))}")
+                
+                # Debug: Try to find next button with multiple selectors
+                if loop == 1:  # Only log this on first iteration to avoid spam
+                    try:
+                        all_buttons = self.browser.find_elements(By.TAG_NAME, "button")
+                        log.debug(f"Total buttons found on page: {len(all_buttons)}")
+                        for btn in all_buttons:
+                            aria_label = btn.get_attribute("aria-label")
+                            if aria_label:
+                                log.debug(f"Button aria-label: '{aria_label}'")
+                        # Also check for the specific next button
+                        next_btns = self.browser.find_elements(By.CSS_SELECTOR, "button[aria-label='Continue to next step']")
+                        log.debug(f"Found {len(next_btns)} buttons with aria-label='Continue to next step'")
+                    except Exception as e:
+                        log.debug(f"Error checking buttons: {e}")
+                
                 # Upload resume
                 if is_present(upload_resume_locator):
                     #upload_locator = self.browser.find_element(By.NAME, "file")
@@ -511,22 +1005,225 @@ class EasyApplyBot:
                     # self.process_questions()
 
                 elif len(self.get_elements("next")) > 0:
+                    log.info("Found 'Continue to next step' button - clicking it")
                     elements = self.get_elements("next")
+                    log.debug(f"Found {len(elements)} 'next' button(s)")
+                    clicked = False
                     for element in elements:
-                        button = self.wait.until(EC.element_to_be_clickable(element))
-                        button.click()
+                        try:
+                            button = self.wait.until(EC.element_to_be_clickable(element))
+                            log.debug(f"Next button is clickable, attempting click")
+                            button.click()
+                            log.info("Clicked 'Next' button successfully")
+                            clicked = True
+                            break
+                        except Exception as click_error:
+                            log.error(f"Failed to click Next button with native click: {click_error}")
+                            # Try JavaScript click - required for elements in shadow DOM
+                            try:
+                                log.info("Trying JavaScript click for Next button")
+                                self.browser.execute_script('arguments[0].click()', button)
+                                log.info("Clicked Next button using JavaScript")
+                                clicked = True
+                                break
+                            except Exception as js_click_error:
+                                log.error(f"JavaScript click also failed: {js_click_error}")
+                    
+                    if not clicked:
+                        # Try alternative selectors if main selector failed
+                        try:
+                            log.info("Trying alternative selector: button[data-easy-apply-next-button]")
+                            alternative_button = self.browser.find_element(By.CSS_SELECTOR, "button[data-easy-apply-next-button]")
+                            alternative_button.click()
+                            log.info("Clicked Next button using alternative selector")
+                            clicked = True
+                        except Exception as alt_error:
+                            log.error(f"Alternative selector also failed: {alt_error}")
+                            try:
+                                log.info("Trying alternative selector: button.artdeco-button--primary")
+                                primary_buttons = self.browser.find_elements(By.CSS_SELECTOR, "button.artdeco-button--primary")
+                                if primary_buttons:
+                                    primary_buttons[-1].click()  # Click the last primary button
+                                    log.info("Clicked Next button using primary class")
+                                    clicked = True
+                            except Exception as alt2_error:
+                                log.error(f"Third attempt failed: {alt2_error}")
+                    
+                    if clicked:
+                        time.sleep(2)  # Wait for next page to load
+                
+                elif len(self.get_elements("next_generic")) > 0:
+                    log.info("Found 'Next' button by text - clicking it")
+                    elements = self.get_elements("next_generic")
+                    log.debug(f"Found {len(elements)} generic 'Next' button(s)")
+                    clicked = False
+                    for element in elements:
+                        try:
+                            # Only click if it's displayed
+                            if element.is_displayed():
+                                button = self.wait.until(EC.element_to_be_clickable(element))
+                                log.debug(f"Next button is clickable, attempting click")
+                                button.click()
+                                log.info("Clicked generic 'Next' button successfully")
+                                clicked = True
+                                break
+                        except Exception as click_error:
+                            log.debug(f"Failed to click generic Next button: {click_error}")
+                            try:
+                                self.browser.execute_script('arguments[0].click()', element)
+                                log.info("Clicked generic Next button using JavaScript")
+                                clicked = True
+                                break
+                            except:
+                                pass
+                    
+                    if clicked:
+                        time.sleep(2)
+                
+                # Try to click button inside shadow DOM using JavaScript
+                if self.shadow_host_selector:
+                    try:
+                        log.info(f"Attempting to click Next button inside shadow DOM at {self.shadow_host_selector}")
+                        # Use JavaScript to find and click the button inside the shadow DOM
+                        button_clicked = self.browser.execute_script("""
+                            // Find the shadow host
+                            var shadowHost = arguments[0];
+                            var shadowRoot = shadowHost.shadowRoot;
+                            if (shadowRoot) {
+                                // Try multiple selectors to find the Next button
+                                var button = shadowRoot.querySelector('button[aria-label="Continue to next step"]') ||
+                                            shadowRoot.querySelector('button[data-easy-apply-next-button]') ||
+                                            shadowRoot.querySelector('button.artdeco-button--primary');
+                                if (button) {
+                                    // Scroll into view first
+                                    button.scrollIntoView({behavior: 'smooth', block: 'center'});
+                                    // Dispatch a proper click event
+                                    button.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        """, self.browser.find_element(By.CSS_SELECTOR, self.shadow_host_selector))
+                        
+                        if button_clicked:
+                            log.info("Successfully clicked Next button inside shadow DOM via JavaScript")
+                            time.sleep(2)
+                            continue  # Skip to next loop iteration
+                    except Exception as shadow_error:
+                        log.debug(f"Failed to click button in shadow DOM: {shadow_error}")
+                
+                # Try data attribute selector
+                try:
+                    alt_button = self.browser.find_element(By.CSS_SELECTOR, "button[data-easy-apply-next-button]")
+                    if alt_button.is_displayed():
+                        log.info("Found Next button using data-easy-apply-next-button attribute")
+                        alt_button.click()
+                        log.info("Clicked Next button successfully")
+                        time.sleep(2)
+                        continue  # Skip to next loop iteration
+                except Exception as e:
+                    log.debug(f"No button with data-easy-apply-next-button: {e}")
+                
+                # Try artdeco-button--primary class
+                try:
+                    primary_buttons = self.browser.find_elements(By.CSS_SELECTOR, "button.artdeco-button--primary")
+                    displayed_primary = [btn for btn in primary_buttons if btn.is_displayed()]
+                    if displayed_primary:
+                        log.info(f"Found {len(displayed_primary)} primary buttons, clicking the last one")
+                        displayed_primary[-1].click()  # Click the last primary button (usually the Next button)
+                        log.info("Clicked Next button using primary class")
+                        time.sleep(2)
+                        continue  # Skip to next loop iteration
+                except Exception as e:
+                    log.debug(f"Error with primary buttons: {e}")
+                
+                # Additional check for any button with aria-label containing "next" or "Continue"
+                found_button = False
+                try:
+                    all_buttons = self.browser.find_elements(By.TAG_NAME, "button")
+                    for btn in all_buttons:
+                        if not btn.is_displayed():
+                            continue
+                        aria_label = btn.get_attribute("aria-label")
+                        if aria_label and ("next" in aria_label.lower() or "continue" in aria_label.lower()):
+                            log.info(f"Found button with aria-label: '{aria_label}'")
+                            try:
+                                btn.click()
+                                log.info("Clicked button successfully")
+                                time.sleep(2)
+                                found_button = True
+                                break  # Exit the for loop
+                            except:
+                                try:
+                                    self.browser.execute_script('arguments[0].click()', btn)
+                                    log.info("Clicked button using JavaScript")
+                                    time.sleep(2)
+                                    found_button = True
+                                    break
+                                except:
+                                    pass
+                    # if we found and clicked a button, skip to next iteration
+                    if found_button:
+                        continue
+                except Exception as e:
+                    log.debug(f"Error in fallback button search: {e}")
 
-                elif len(self.get_elements("review")) > 0:
+                # Check for review button
+                if len(self.get_elements("review")) > 0:
                     elements = self.get_elements("review")
                     for element in elements:
                         button = self.wait.until(EC.element_to_be_clickable(element))
                         button.click()
 
+                # Check for follow button
                 elif len(self.get_elements("follow")) > 0:
                     elements = self.get_elements("follow")
                     for element in elements:
                         button = self.wait.until(EC.element_to_be_clickable(element))
                         button.click()
+                else:
+                    log.debug("No buttons found on this step. Waiting...")
+                    # Last resort: search for ANY button with "Next" aria-label
+                    try:
+                        all_buttons = self.browser.find_elements(By.TAG_NAME, "button")
+                        for btn in all_buttons:
+                            aria_label = btn.get_attribute("aria-label")
+                            btn_text = btn.text.strip()
+                            # Look for "Next" button
+                            if aria_label and ("next" in aria_label.lower() or "Next" in aria_label):
+                                log.info(f"Found Next button with aria-label: '{aria_label}'")
+                                try:
+                                    btn.click()
+                                    log.info("Successfully clicked Next button")
+                                    time.sleep(2)
+                                    break
+                                except:
+                                    try:
+                                        self.browser.execute_script('arguments[0].click()', btn)
+                                        log.info("Clicked Next button with JavaScript")
+                                        time.sleep(2)
+                                        break
+                                    except:
+                                        pass
+                            elif btn_text and "Next" in btn_text and btn.is_displayed():
+                                log.info(f"Found Next button with text: '{btn_text}'")
+                                try:
+                                    btn.click()
+                                    log.info("Successfully clicked Next button")
+                                    time.sleep(2)
+                                    break
+                                except:
+                                    try:
+                                        self.browser.execute_script('arguments[0].click()', btn)
+                                        log.info("Clicked Next button with JavaScript")
+                                        time.sleep(2)
+                                        break
+                                    except:
+                                        pass
+                    except Exception as e:
+                        log.debug(f"Error in fallback Next button search: {e}")
+                    
+                    time.sleep(2)
 
         except Exception as e:
             log.error(e)
